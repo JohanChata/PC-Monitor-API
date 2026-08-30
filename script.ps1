@@ -5,23 +5,34 @@ $API_KEY = "PCMONITOR_CAMBIA_ESTA_CLAVE_2026"
 # Iniciar cronómetro de recopilación
 $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-# 1. Obtención de Ubicación por IP y enlace a Google Maps
-$GeoIP = Try { Invoke-RestMethod -Uri "https://ipapi.co/json/" -TimeoutSec 5 } Catch { $null }
+# 1. Obtención de Ubicación por IP (Con User-Agent de Chrome para evitar bloqueos)
+$UA = @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" }
 
-if ($GeoIP -and $GeoIP.latitude -and $GeoIP.longitude) {
-    $Lat          = $GeoIP.latitude
-    $Lon          = $GeoIP.longitude
+# Intento 1: ipinfo.io
+$GeoIP = Try { Invoke-RestMethod -Uri "https://ipinfo.io/json" -Headers $UA -TimeoutSec 5 } Catch { $null }
+
+if ($GeoIP -and $GeoIP.loc) {
+    $coords       = $GeoIP.loc -split ","
+    $Lat          = $coords[0]
+    $Lon          = $coords[1]
     $IP_Publica   = $GeoIP.ip
     $GoogleMaps   = "https://www.google.com/maps?q=$Lat,$Lon"
-    $Precision    = 5000 # Precisión estimada por IP en metros (~5 km)
-    $FuenteUbic   = "IP Geolocation ($($GeoIP.city), $($GeoIP.country_name))"
+    $Precision    = 5000
+    $FuenteUbic   = "ipinfo.io ($($GeoIP.city), $($GeoIP.country))"
 } else {
-    $Lat          = $null
-    $Lon          = $null
-    $IP_Publica   = $null
-    $GoogleMaps   = $null
-    $Precision    = $null
-    $FuenteUbic   = $null
+    # Intento 2: ip-api.com
+    $GeoIP2 = Try { Invoke-RestMethod -Uri "http://ip-api.com/json/" -Headers $UA -TimeoutSec 5 } Catch { $null }
+    
+    if ($GeoIP2 -and $GeoIP2.status -eq "success") {
+        $Lat          = $GeoIP2.lat
+        $Lon          = $GeoIP2.lon
+        $IP_Publica   = $GeoIP2.query
+        $GoogleMaps   = "https://www.google.com/maps?q=$Lat,$Lon"
+        $Precision    = 5000 
+        $FuenteUbic   = "ip-api.com ($($GeoIP2.city), $($GeoIP2.country))"
+    } else {
+        $Lat = $Lon = $IP_Publica = $GoogleMaps = $Precision = $FuenteUbic = $null
+    }
 }
 
 # 2. Datos del Sistema y Usuario
@@ -110,7 +121,7 @@ $Report = @{
     GPU                   = $GPUs
     Discos                = $Disks
 
-    # Campos de Geolocalización y Maps
+    # Campos de Geolocalización
     IP_Publica            = $IP_Publica
     Latitud               = $Lat
     Longitud              = $Lon
@@ -125,7 +136,7 @@ $Report = @{
     Consentimiento        = $true
 }
 
-# Convertir a JSON enviando todos los datos
+# Convertir a JSON
 $JsonPayload = $Report | ConvertTo-Json -Depth 5 -Compress
 
 $Headers = @{
@@ -133,9 +144,9 @@ $Headers = @{
     "X-API-Key"    = $API_KEY
 }
 
-# Enviar los datos POST a la API de Render
+# Enviar los datos POST a la API
 try {
     Invoke-RestMethod -Uri $API_URL -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($JsonPayload)) -Headers $Headers -TimeoutSec 30
 } catch {
-    # Silencioso en caso de error
+    # Silencioso
 }
