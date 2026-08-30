@@ -4,47 +4,51 @@ $API_KEY = "PCMONITOR_CAMBIA_ESTA_CLAVE_2026"
 
 $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-# 1. Obtener ubicación exacta mediante la API nativa de Windows (WinRT Location)
+# 1. Obtención de Ubicación Nativa en Tiempo Real (Windows Location API)
 $Lat = $Lon = $Precision = $FuenteUbic = $GoogleMaps = $null
 
 try {
+    # Cargar API de geolocalización nativa de Windows
     Add-Type -AssemblyName System.Device
     $Watcher = New-Object System.Device.Location.GeoCoordinateWatcher([System.Device.Location.GeoPositionAccuracy]::High)
     $Watcher.Start()
 
-    # Esperar hasta 5 segundos para obtener fijación de señal precisa
-    $cnt = 0
-    while (($Watcher.Status -ne [System.Device.Location.GeoPositionStatus]::Ready) -and ($cnt -lt 50)) {
+    # Esperar a que los sensores de red/Wi-Fi triangulen la posición real (hasta 6 segundos)
+    $timeout = 0
+    while (($Watcher.Status -ne [System.Device.Location.GeoPositionStatus]::Ready) -and ($timeout -lt 60)) {
         Start-Sleep -Milliseconds 100
-        $cnt++
+        $timeout++
     }
 
     $Pos = $Watcher.Position.Location
     if (-not $Pos.IsUnknown) {
         $Lat        = $Pos.Latitude
-        $Lon        = $Pos.Longitude
+        $PosLat     = [math]::Round($Pos.Latitude, 6)
+        $PosLon     = [math]::Round($Pos.Longitude, 6)
+        $Lat        = $PosLat
+        $Lon        = $PosLon
         $Precision  = [math]::Round($Pos.HorizontalAccuracy, 2)
-        $FuenteUbic = "Windows Sensor / Wi-Fi Triangulation"
-        $GoogleMaps = "https://www.google.com/maps?q=$Lat,$Lon"
+        $FuenteUbic = "Windows Sensor (GPS/Wi-Fi Real Time)"
+        $GoogleMaps = "https://www.google.com/maps?q=$PosLat,$PosLon"
     }
 } catch {
-    # Si el sensor de Windows falla o está desactivado, el bloque try continúa
+    # Manejo en caso de fallo
 }
 
-# Fallback: Si no se pudo obtener por sensor, consulta IP pública
+# Si la ubicación por sensor está desactivada en Windows, usa IP pública como respaldo
 if (-not $Lat) {
-    $GeoIP = Try { Invoke-RestMethod -Uri "https://ipinfo.io/json" -TimeoutSec 4 } Catch { $null }
+    $GeoIP = Try { Invoke-RestMethod -Uri "https://ipinfo.io/json" -TimeoutSec 5 } Catch { $null }
     if ($GeoIP -and $GeoIP.loc) {
         $coords     = $GeoIP.loc -split ","
         $Lat        = $coords[0]
         $Lon        = $coords[1]
         $Precision  = 5000
-        $FuenteUbic = "IP Geolocation (Aproximado)"
+        $FuenteUbic = "IP Geolocation (Nodo ISP / Aproximado)"
         $GoogleMaps = "https://www.google.com/maps?q=$Lat,$Lon"
     }
 }
 
-# 2. Datos de Hardware y Red
+# 2. Recopilación de Hardware y Sistema
 $ComputerName = $env:COMPUTERNAME
 $Username     = $env:USERNAME
 
@@ -93,7 +97,7 @@ $NetAdapters = Get-NetAdapter | ForEach-Object {
 
 $Stopwatch.Stop()
 
-# 3. Estructura de envío
+# 3. Empaquetar y enviar a la API
 $Report = @{
     NombreEquipo          = $ComputerName
     Equipo                = $ComputerName
@@ -120,7 +124,7 @@ $Report = @{
 }
 
 $JsonPayload = $Report | ConvertTo-Json -Depth 5 -Compress
-$Headers = @{ "Content-Type" = "application/json; charset=utf-8"; "X-API-Key" = $API_KEY }
+$Headers     = @{ "Content-Type" = "application/json; charset=utf-8"; "X-API-Key" = $API_KEY }
 
 try {
     Invoke-RestMethod -Uri $API_URL -Method Post -Body ([System.Text.Encoding]::UTF8.GetBytes($JsonPayload)) -Headers $Headers -TimeoutSec 30
