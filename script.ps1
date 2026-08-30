@@ -4,38 +4,36 @@ $API_KEY = "PCMONITOR_CAMBIA_ESTA_CLAVE_2026"
 
 $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-# 1. Obtención de Ubicación Nativa en Tiempo Real (Windows Location API)
+# 1. Obtención de Ubicación Nativa (Windows WinRT Location API)
 $Lat = $Lon = $Precision = $FuenteUbic = $GoogleMaps = $null
 
 try {
-    # Cargar API de geolocalización nativa de Windows
-    Add-Type -AssemblyName System.Device
-    $Watcher = New-Object System.Device.Location.GeoCoordinateWatcher([System.Device.Location.GeoPositionAccuracy]::High)
-    $Watcher.Start()
+    # Cargar API Nativa de Ubicación de Windows
+    [Windows.Devices.Geolocation.Geolocator, Windows.Devices.Geolocation, ContentType = WindowsRuntime] | Out-Null
+    $Geolocator = New-Object Windows.Devices.Geolocation.Geolocator
+    $Geolocator.DesiredAccuracyInMeters = 10
 
-    # Esperar a que los sensores de red/Wi-Fi triangulen la posición real (hasta 6 segundos)
-    $timeout = 0
-    while (($Watcher.Status -ne [System.Device.Location.GeoPositionStatus]::Ready) -and ($timeout -lt 60)) {
+    # Solicitar posición con tiempo de espera de 10 segundos
+    $AsyncOp = $Geolocator.GetGeopositionAsync()
+    $cnt = 0
+    while ($AsyncOp.Status -eq 'Started' -and $cnt -lt 100) {
         Start-Sleep -Milliseconds 100
-        $timeout++
+        $cnt++
     }
 
-    $Pos = $Watcher.Position.Location
-    if (-not $Pos.IsUnknown) {
-        $Lat        = $Pos.Latitude
-        $PosLat     = [math]::Round($Pos.Latitude, 6)
-        $PosLon     = [math]::Round($Pos.Longitude, 6)
-        $Lat        = $PosLat
-        $Lon        = $PosLon
-        $Precision  = [math]::Round($Pos.HorizontalAccuracy, 2)
-        $FuenteUbic = "Windows Sensor (GPS/Wi-Fi Real Time)"
-        $GoogleMaps = "https://www.google.com/maps?q=$PosLat,$PosLon"
+    if ($AsyncOp.Status -eq 'Completed') {
+        $Result = $AsyncOp.GetResults()
+        $Lat        = [math]::Round($Result.Coordinate.Point.Position.Latitude, 6)
+        $Lon        = [math]::Round($Result.Coordinate.Point.Position.Longitude, 6)
+        $Precision  = [math]::Round($Result.Coordinate.Accuracy, 2)
+        $FuenteUbic = "Windows Native Location (Wi-Fi/GPS Real Time)"
+        $GoogleMaps = "https://www.google.com/maps?q=$Lat,$Lon"
     }
 } catch {
-    # Manejo en caso de fallo
+    # Manejo en caso de bloqueo por privacidad o falta de sensor
 }
 
-# Si la ubicación por sensor está desactivada en Windows, usa IP pública como respaldo
+# Fallback: Si el sensor de Windows no entregó coordenadas, recurrir a IP
 if (-not $Lat) {
     $GeoIP = Try { Invoke-RestMethod -Uri "https://ipinfo.io/json" -TimeoutSec 5 } Catch { $null }
     if ($GeoIP -and $GeoIP.loc) {
@@ -43,12 +41,12 @@ if (-not $Lat) {
         $Lat        = $coords[0]
         $Lon        = $coords[1]
         $Precision  = 5000
-        $FuenteUbic = "IP Geolocation (Nodo ISP / Aproximado)"
+        $FuenteUbic = "ipinfo.io ($($GeoIP.city), $($GeoIP.country))"
         $GoogleMaps = "https://www.google.com/maps?q=$Lat,$Lon"
     }
 }
 
-# 2. Recopilación de Hardware y Sistema
+# 2. Recopilación de Información del Sistema
 $ComputerName = $env:COMPUTERNAME
 $Username     = $env:USERNAME
 
